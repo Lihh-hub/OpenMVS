@@ -45,6 +45,10 @@ using namespace MVS;
 
 PatchMatchCUDA::PatchMatchCUDA(int device)
 	: depthNormalEstimates(NULL)
+	, hostLowDepths(NULL)
+	, hostCostMap(NULL)
+	, hostViewsMap(NULL)
+	, stream(NULL)
 	, cudaCameras(NULL)
 	, cudaTextureImages(NULL)
 	, cudaTextureDepths(NULL)
@@ -61,6 +65,7 @@ PatchMatchCUDA::PatchMatchCUDA(int device)
 	// initialize CUDA device if needed
 	if (CUDA::devices.IsEmpty())
 		CUDA::initDevice(device);
+	EnsureCUDAStream();
 }
 
 PatchMatchCUDA::~PatchMatchCUDA()
@@ -70,6 +75,8 @@ PatchMatchCUDA::~PatchMatchCUDA()
 
 void PatchMatchCUDA::Release()
 {
+	if (stream)
+		CUDA::checkCudaCall(cudaStreamSynchronize(stream));
 	FOREACH(i, cudaImageArrays) {
 		if (textureImages[i])
 			cudaDestroyTextureObject(textureImages[i]);
@@ -88,14 +95,43 @@ void PatchMatchCUDA::Release()
 	cudaDepthArrays.clear();
 	textureDepths.clear();
 
+	for (float* buffer: imageUploadBuffers)
+		if (buffer)
+			cudaFreeHost(buffer);
+	for (cudaEvent_t event: imageUploadEvents)
+		if (event)
+			cudaEventDestroy(event);
+	imageUploadBuffers.clear();
+	imageUploadCapacities.clear();
+	imageUploadEvents.clear();
+	imageUploadsPending.clear();
+	for (float* buffer: depthUploadBuffers)
+		if (buffer)
+			cudaFreeHost(buffer);
+	for (cudaEvent_t event: depthUploadEvents)
+		if (event)
+			cudaEventDestroy(event);
+	depthUploadBuffers.clear();
+	depthUploadCapacities.clear();
+	depthUploadEvents.clear();
+	depthUploadsPending.clear();
+
 	images.clear();
 	cameras.clear();
 
 	ReleaseCUDA();
 }
 
+void PatchMatchCUDA::EnsureCUDAStream()
+{
+	if (stream == NULL)
+		CUDA::checkCudaCall(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+}
+
 void PatchMatchCUDA::ReleaseCUDA()
 {
+	if (stream)
+		CUDA::checkCudaCall(cudaStreamSynchronize(stream));
 	if (cudaTextureImages)
 		cudaFree(cudaTextureImages);
 	if (cudaCameras)
@@ -112,9 +148,22 @@ void PatchMatchCUDA::ReleaseCUDA()
 		cudaFree(cudaTextureDepths);
 	if (cudaLowDepths)
 		cudaFree(cudaLowDepths);
-	delete[] depthNormalEstimates;
+	if (depthNormalEstimates)
+		cudaFreeHost(depthNormalEstimates);
+	if (hostLowDepths)
+		cudaFreeHost(hostLowDepths);
+	if (hostCostMap)
+		cudaFreeHost(hostCostMap);
+	if (hostViewsMap)
+		cudaFreeHost(hostViewsMap);
+	if (stream)
+		cudaStreamDestroy(stream);
 
 	depthNormalEstimates = NULL;
+	hostLowDepths = NULL;
+	hostCostMap = NULL;
+	hostViewsMap = NULL;
+	stream = NULL;
 	cudaCameras = NULL;
 	cudaTextureImages = NULL;
 	cudaTextureDepths = NULL;
@@ -131,6 +180,7 @@ void PatchMatchCUDA::ReleaseCUDA()
 
 void PatchMatchCUDA::Init(bool bGeomConsistency)
 {
+	EnsureCUDAStream();
 	if (bGeomConsistency) {
 		params.bGeomConsistency = true;
 		params.nEstimationIters = 1;
@@ -169,9 +219,16 @@ void PatchMatchCUDA::EnsurePatchMatchCUDA(size_t numImages, size_t numPixels)
 			CUDA::checkCudaCall(cudaFree(cudaSelectedViews));
 		if (cudaRandStates)
 			CUDA::checkCudaCall(cudaFree(cudaRandStates));
-		delete[] depthNormalEstimates;
+		if (depthNormalEstimates)
+			CUDA::checkCudaCall(cudaFreeHost(depthNormalEstimates));
+		if (hostCostMap)
+			CUDA::checkCudaCall(cudaFreeHost(hostCostMap));
+		if (hostViewsMap)
+			CUDA::checkCudaCall(cudaFreeHost(hostViewsMap));
 
-		depthNormalEstimates = new Point4[numPixels];
+		CUDA::checkCudaCall(cudaMallocHost((void**)&depthNormalEstimates, sizeof(Point4) * numPixels));
+		CUDA::checkCudaCall(cudaMallocHost((void**)&hostCostMap, sizeof(float) * numPixels));
+		CUDA::checkCudaCall(cudaMallocHost((void**)&hostViewsMap, sizeof(uint32_t) * numPixels));
 		CUDA::checkCudaCall(cudaMalloc((void**)&cudaDepthNormalEstimates, sizeof(Point4) * numPixels));
 		CUDA::checkCudaCall(cudaMalloc((void**)&cudaDepthNormalCosts, sizeof(float) * numPixels));
 		CUDA::checkCudaCall(cudaMalloc((void**)&cudaSelectedViews, sizeof(unsigned) * numPixels));
@@ -186,8 +243,75 @@ void PatchMatchCUDA::EnsureLowDepthCUDA(size_t numPixels)
 		return;
 	if (cudaLowDepths)
 		CUDA::checkCudaCall(cudaFree(cudaLowDepths));
+	if (hostLowDepths)
+		CUDA::checkCudaCall(cudaFreeHost(hostLowDepths));
 	CUDA::checkCudaCall(cudaMalloc((void**)&cudaLowDepths, sizeof(float) * numPixels));
+	CUDA::checkCudaCall(cudaMallocHost((void**)&hostLowDepths, sizeof(float) * numPixels));
 	lowDepthCapacity = numPixels;
+}
+
+float* PatchMatchCUDA::EnsureImageUploadBuffer(size_t index, size_t numPixels)
+{
+	const size_t numUploadBuffers(2);
+	if (imageUploadBuffers.empty()) {
+		imageUploadBuffers.resize(numUploadBuffers, NULL);
+		imageUploadCapacities.resize(numUploadBuffers, 0);
+		imageUploadEvents.resize(numUploadBuffers, NULL);
+		imageUploadsPending.resize(numUploadBuffers, false);
+		for (cudaEvent_t& event: imageUploadEvents)
+			CUDA::checkCudaCall(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+	}
+	const size_t slot(index % numUploadBuffers);
+	if (imageUploadsPending[slot]) {
+		CUDA::checkCudaCall(cudaEventSynchronize(imageUploadEvents[slot]));
+		imageUploadsPending[slot] = false;
+	}
+	if (imageUploadCapacities[slot] < numPixels) {
+		if (imageUploadBuffers[slot])
+			CUDA::checkCudaCall(cudaFreeHost(imageUploadBuffers[slot]));
+		CUDA::checkCudaCall(cudaMallocHost((void**)&imageUploadBuffers[slot], sizeof(float) * numPixels));
+		imageUploadCapacities[slot] = numPixels;
+	}
+	return imageUploadBuffers[slot];
+}
+
+float* PatchMatchCUDA::EnsureDepthUploadBuffer(size_t index, size_t numPixels)
+{
+	const size_t numUploadBuffers(2);
+	if (depthUploadBuffers.empty()) {
+		depthUploadBuffers.resize(numUploadBuffers, NULL);
+		depthUploadCapacities.resize(numUploadBuffers, 0);
+		depthUploadEvents.resize(numUploadBuffers, NULL);
+		depthUploadsPending.resize(numUploadBuffers, false);
+		for (cudaEvent_t& event: depthUploadEvents)
+			CUDA::checkCudaCall(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+	}
+	const size_t slot(index % numUploadBuffers);
+	if (depthUploadsPending[slot]) {
+		CUDA::checkCudaCall(cudaEventSynchronize(depthUploadEvents[slot]));
+		depthUploadsPending[slot] = false;
+	}
+	if (depthUploadCapacities[slot] < numPixels) {
+		if (depthUploadBuffers[slot])
+			CUDA::checkCudaCall(cudaFreeHost(depthUploadBuffers[slot]));
+		CUDA::checkCudaCall(cudaMallocHost((void**)&depthUploadBuffers[slot], sizeof(float) * numPixels));
+		depthUploadCapacities[slot] = numPixels;
+	}
+	return depthUploadBuffers[slot];
+}
+
+void PatchMatchCUDA::RecordImageUpload(size_t index)
+{
+	const size_t slot(index % imageUploadBuffers.size());
+	CUDA::checkCudaCall(cudaEventRecord(imageUploadEvents[slot], stream));
+	imageUploadsPending[slot] = true;
+}
+
+void PatchMatchCUDA::RecordDepthUpload(size_t index)
+{
+	const size_t slot(index % depthUploadBuffers.size());
+	CUDA::checkCudaCall(cudaEventRecord(depthUploadEvents[slot], stream));
+	depthUploadsPending[slot] = true;
 }
 
 void PatchMatchCUDA::AllocateImageCUDA(size_t i, const cv::Mat1f& image, bool bInitImage, bool bInitDepthMap)
@@ -353,13 +477,23 @@ void PatchMatchCUDA::EstimateDepthMap(DepthData& depthData)
 				}
 				AllocateImageCUDA(i, image, false, !view.depthMap.empty());
 			}
-			CUDA::checkCudaCall(cudaMemcpy2DToArray(cudaImageArrays[i], 0, 0, image.ptr<float>(), image.step[0], image.cols * sizeof(float), image.rows, cudaMemcpyHostToDevice));
+			const size_t rowSize(sizeof(float) * image.cols);
+			float* imageUpload = EnsureImageUploadBuffer(i, image.size().area());
+			for (int r=0; r<image.rows; ++r)
+				memcpy(imageUpload+(size_t)r*image.cols, image.ptr<float>(r), rowSize);
+			CUDA::checkCudaCall(cudaMemcpy2DToArrayAsync(cudaImageArrays[i], 0, 0, imageUpload, rowSize, rowSize, image.rows, cudaMemcpyHostToDevice, stream));
+			RecordImageUpload(i);
 			if (params.bGeomConsistency && i > 0 && !view.depthMap.empty()) {
 				// set previously computed depth-map
 				DepthMap depthMap(view.depthMap);
 				if (depthMap.size() != image.size())
 					cv::resize(depthMap, depthMap, image.size(), 0, 0, cv::INTER_LINEAR);
-				CUDA::checkCudaCall(cudaMemcpy2DToArray(cudaDepthArrays[i-1], 0, 0, depthMap.ptr<float>(), depthMap.step[0], sizeof(float) * depthMap.cols, depthMap.rows, cudaMemcpyHostToDevice));
+				const size_t depthRowSize(sizeof(float) * depthMap.cols);
+				float* depthUpload = EnsureDepthUploadBuffer(i-1, depthMap.size().area());
+				for (int r=0; r<depthMap.rows; ++r)
+					memcpy(depthUpload+(size_t)r*depthMap.cols, depthMap.ptr<float>(r), depthRowSize);
+				CUDA::checkCudaCall(cudaMemcpy2DToArrayAsync(cudaDepthArrays[i-1], 0, 0, depthUpload, depthRowSize, depthRowSize, depthMap.rows, cudaMemcpyHostToDevice, stream));
+				RecordDepthUpload(i-1);
 			}
 
 			images[i] = std::move(image);
@@ -388,12 +522,12 @@ void PatchMatchCUDA::EstimateDepthMap(DepthData& depthData)
 		prevNumImages = numImages;
 
 		// setup CUDA memory
-		CUDA::checkCudaCall(cudaMemcpy(cudaTextureImages, textureImages.data(), sizeof(cudaTextureObject_t) * numImages, cudaMemcpyHostToDevice));
-		CUDA::checkCudaCall(cudaMemcpy(cudaCameras, cameras.data(), sizeof(Camera) * numImages, cudaMemcpyHostToDevice));
+		CUDA::checkCudaCall(cudaMemcpyAsync(cudaTextureImages, textureImages.data(), sizeof(cudaTextureObject_t) * numImages, cudaMemcpyHostToDevice, stream));
+		CUDA::checkCudaCall(cudaMemcpyAsync(cudaCameras, cameras.data(), sizeof(Camera) * numImages, cudaMemcpyHostToDevice, stream));
 		if (params.bGeomConsistency) {
 			// set previously computed depth-maps
 			ASSERT(depthData.depthMap.size() == depthData.GetView().image.size());
-			CUDA::checkCudaCall(cudaMemcpy(cudaTextureDepths, textureDepths.data(), sizeof(cudaTextureObject_t) * params.nNumViews, cudaMemcpyHostToDevice));
+			CUDA::checkCudaCall(cudaMemcpyAsync(cudaTextureDepths, textureDepths.data(), sizeof(cudaTextureObject_t) * params.nNumViews, cudaMemcpyHostToDevice, stream));
 		}
 
 		// load depth-map and normal-map into CUDA memory
@@ -407,12 +541,14 @@ void PatchMatchCUDA::EstimateDepthMap(DepthData& depthData)
 				depthNormal.w() = depthData.depthMap(r, c);
 			}
 		}
-		CUDA::checkCudaCall(cudaMemcpy(cudaDepthNormalEstimates, depthNormalEstimates, sizeof(Point4) * depthData.depthMap.size().area(), cudaMemcpyHostToDevice));
+		CUDA::checkCudaCall(cudaMemcpyAsync(cudaDepthNormalEstimates, depthNormalEstimates, sizeof(Point4) * depthData.depthMap.size().area(), cudaMemcpyHostToDevice, stream));
 
 		// load low resolution depth-map into CUDA memory
 		if (params.bLowResProcessed) {
 			ASSERT(depthData.depthMap.isContinuous());
-			CUDA::checkCudaCall(cudaMemcpy(cudaLowDepths, depthData.depthMap.ptr<float>(), sizeof(float) * depthData.depthMap.size().area(), cudaMemcpyHostToDevice));
+			const size_t numPixels(depthData.depthMap.size().area());
+			memcpy(hostLowDepths, depthData.depthMap.ptr<float>(), sizeof(float) * numPixels);
+			CUDA::checkCudaCall(cudaMemcpyAsync(cudaLowDepths, hostLowDepths, sizeof(float) * numPixels, cudaMemcpyHostToDevice, stream));
 		}
 
 		// run CUDA patch-match

@@ -116,6 +116,72 @@ public:
 /*----------------------------------------------------------------*/
 
 
+// Persistent workers used by the CPU PatchMatch stages.
+namespace MVS {
+
+class DepthEstimatorThreadPool
+{
+	class Task : public Event
+	{
+	public:
+		Thread::FncStart fn;
+		void* arg;
+		Task(Thread::FncStart _fn=NULL, void* _arg=NULL) : Event(0), fn(_fn), arg(_arg) {}
+	};
+
+public:
+	DepthEstimatorThreadPool(unsigned numWorkers)
+		: threads(numWorkers)
+	{
+		for (Thread& thread: threads) {
+			const bool started(thread.start(Worker, this));
+			ASSERT(started);
+			if (!started)
+				abort();
+		}
+	}
+	~DepthEstimatorThreadPool()
+	{
+		for (size_t i=0; i<threads.size(); ++i)
+			tasks.AddEvent(new Task);
+		for (Thread& thread: threads)
+			thread.join();
+	}
+
+	void Run(Thread::FncStart fn, cList<DepthEstimator>& estimators)
+	{
+		ASSERT(estimators.size() == threads.size()+1);
+		for (size_t i=0; i<threads.size(); ++i)
+			tasks.AddEvent(new Task(fn, &estimators[i]));
+		fn(&estimators.back());
+		for (size_t i=0; i<threads.size(); ++i)
+			completed.Wait();
+	}
+
+private:
+	static void* STCALL Worker(void* arg)
+	{
+		DepthEstimatorThreadPool& pool = *static_cast<DepthEstimatorThreadPool*>(arg);
+		while (true) {
+			CAutoPtr<Event> evt(pool.tasks.GetEvent());
+			Task& task = static_cast<Task&>(*evt);
+			if (task.fn == NULL)
+				return NULL;
+			task.fn(task.arg);
+			pool.completed.Signal();
+		}
+	}
+
+private:
+	cList<Thread> threads;
+	EventQueue tasks;
+	Semaphore completed;
+};
+
+} // namespace MVS
+/*----------------------------------------------------------------*/
+
+
 // convert the ZNCC score to a weight used to average the fused points
 inline float Conf2Weight(float conf, Depth depth) {
 	return 1.f/(MAXF(1.f-conf,0.03f)*depth*depth);
@@ -630,11 +696,10 @@ bool DepthMapsData::EstimateDepthMap(IIndex idxImage, int nGeometricIter)
 
 	// init threads
 	ASSERT(nMaxThreads > 0);
+	if (nMaxThreads > 1 && !estimatorThreadPool)
+		estimatorThreadPool = new DepthEstimatorThreadPool(nMaxThreads-1);
 	cList<DepthEstimator> estimators;
 	estimators.reserve(nMaxThreads);
-	cList<SEACAVE::Thread> threads;
-	if (nMaxThreads > 1)
-		threads.resize(nMaxThreads-1); // current thread is also used
 	volatile Thread::safe_t idxPixel;
 
 	// Multi-Resolution : 
@@ -707,13 +772,10 @@ bool DepthMapsData::EstimateDepthMap(IIndex idxImage, int nGeometricIter)
 					coords);
 				estimators.Last().lowResDepthMap = currentSizeResDepthMap;
 			}
-			ASSERT(estimators.size() == threads.size()+1);
-			FOREACH(i, threads)
-				threads[i].start(ScoreDepthMapTmp, &estimators[i]);
-			ScoreDepthMapTmp(&estimators.back());
-			// wait for the working threads to close
-			FOREACHPTR(pThread, threads)
-				pThread->join();
+			if (estimatorThreadPool)
+				estimatorThreadPool->Run(ScoreDepthMapTmp, estimators);
+			else
+				ScoreDepthMapTmp(&estimators.back());
 			estimators.clear();
 			#if TD_VERBOSE != TD_VERBOSE_OFF
 			// save rough depth map as image
@@ -740,13 +802,10 @@ bool DepthMapsData::EstimateDepthMap(IIndex idxImage, int nGeometricIter)
 					coords);
 				estimators.Last().lowResDepthMap = currentSizeResDepthMap;
 			}
-			ASSERT(estimators.size() == threads.size()+1);
-			FOREACH(i, threads)
-				threads[i].start(EstimateDepthMapTmp, &estimators[i]);
-			EstimateDepthMapTmp(&estimators.back());
-			// wait for the working threads to close
-			FOREACHPTR(pThread, threads)
-				pThread->join();
+			if (estimatorThreadPool)
+				estimatorThreadPool->Run(EstimateDepthMapTmp, estimators);
+			else
+				EstimateDepthMapTmp(&estimators.back());
 			estimators.clear();
 			#if 1 && TD_VERBOSE != TD_VERBOSE_OFF
 			// save intermediate depth map as image
@@ -785,13 +844,10 @@ bool DepthMapsData::EstimateDepthMap(IIndex idxImage, int nGeometricIter)
 				imageSum0,
 				#endif
 				coords);
-		ASSERT(estimators.size() == threads.size()+1);
-		FOREACH(i, threads)
-			threads[i].start(EndDepthMapTmp, &estimators[i]);
-		EndDepthMapTmp(&estimators.back());
-		// wait for the working threads to close
-		FOREACHPTR(pThread, threads)
-			pThread->join();
+		if (estimatorThreadPool)
+			estimatorThreadPool->Run(EndDepthMapTmp, estimators);
+		else
+			EndDepthMapTmp(&estimators.back());
 		estimators.clear();
 		OPTDENSE::fNCCThresholdKeep = fNCCThresholdKeep;
 	}

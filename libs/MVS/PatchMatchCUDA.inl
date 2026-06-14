@@ -111,9 +111,14 @@ public:
 	float GetCost(const int index);
 
 private:
+	void EnsureCUDAStream();
 	void ReleaseCUDA();
 	void EnsurePatchMatchCUDA(size_t numImages, size_t numPixels);
 	void EnsureLowDepthCUDA(size_t numPixels);
+	float* EnsureImageUploadBuffer(size_t index, size_t numPixels);
+	float* EnsureDepthUploadBuffer(size_t index, size_t numPixels);
+	void RecordImageUpload(size_t index);
+	void RecordDepthUpload(size_t index);
 	void AllocateImageCUDA(size_t i, const cv::Mat1f& image, bool bInitImage, bool bInitDepthMap);
 	void RunCUDA(float* ptrCostMap=NULL, uint32_t* ptrViewsMap=NULL);
 
@@ -124,8 +129,20 @@ public:
 	std::vector<Camera> cameras;
 	std::vector<cudaTextureObject_t> textureImages;
 	std::vector<cudaTextureObject_t> textureDepths;
+	std::vector<float*> imageUploadBuffers;
+	std::vector<float*> depthUploadBuffers;
+	std::vector<size_t> imageUploadCapacities;
+	std::vector<size_t> depthUploadCapacities;
+	std::vector<cudaEvent_t> imageUploadEvents;
+	std::vector<cudaEvent_t> depthUploadEvents;
+	std::vector<bool> imageUploadsPending;
+	std::vector<bool> depthUploadsPending;
 	Point4* depthNormalEstimates;
+	float* hostLowDepths;
+	float* hostCostMap;
+	uint32_t* hostViewsMap;
 
+	cudaStream_t stream;
 	Camera *cudaCameras;
 	std::vector<cudaArray_t> cudaImageArrays;
 	std::vector<cudaArray_t> cudaDepthArrays;

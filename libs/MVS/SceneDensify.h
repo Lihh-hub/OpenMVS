@@ -44,6 +44,7 @@ namespace MVS {
 	
 // Forward declarations
 class MVS_API Scene;
+class DepthEstimatorThreadPool;
 #ifdef _USE_CUDA
 class PatchMatchCUDA;
 #endif // _USE_CUDA
@@ -85,6 +86,7 @@ public:
 	Image8U::Size prevDepthMapSizeTrg; // ... same for target image
 	DepthEstimator::MapRefArr coords; // map pixel index to zigzag matrix coordinates
 	DepthEstimator::MapRefArr coordsTrg; // ... same for target image
+	CAutoPtr<DepthEstimatorThreadPool> estimatorThreadPool;
 
 	#ifdef _USE_CUDA
 	// used internally to estimate the depth-maps using CUDA

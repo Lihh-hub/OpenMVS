@@ -640,25 +640,31 @@ __host__ void PatchMatchCUDA::RunCUDA(float* ptrCostMap, uint32_t* ptrViewsMap)
 	const dim3 gridSizeFull((width + BLOCK_W - 1) / BLOCK_W, (height + BLOCK_H - 1) / BLOCK_H, 1);
 	const dim3 gridSizeCheckerboard((width + BLOCK_W - 1) / BLOCK_W, ((height / 2) + BLOCK_H - 1) / BLOCK_H, 1);
 
-	InitializeScore<<<gridSizeFull, blockSize>>>(cudaTextureImages, cudaTextureDepths, cudaCameras, cudaDepthNormalEstimates, cudaLowDepths, cudaDepthNormalCosts, cudaRandStates, cudaSelectedViews, params);
+	InitializeScore<<<gridSizeFull, blockSize, 0, stream>>>(cudaTextureImages, cudaTextureDepths, cudaCameras, cudaDepthNormalEstimates, cudaLowDepths, cudaDepthNormalCosts, cudaRandStates, cudaSelectedViews, params);
 	CUDA::checkCudaCall(cudaGetLastError());
 
 	for (int iter = 0; iter < params.nEstimationIters; ++iter) {
-		BlackPixelProcess<<<gridSizeCheckerboard, blockSize>>>(cudaTextureImages, cudaTextureDepths, cudaCameras, cudaDepthNormalEstimates, cudaLowDepths, cudaDepthNormalCosts, cudaRandStates, cudaSelectedViews, params, iter);
+		BlackPixelProcess<<<gridSizeCheckerboard, blockSize, 0, stream>>>(cudaTextureImages, cudaTextureDepths, cudaCameras, cudaDepthNormalEstimates, cudaLowDepths, cudaDepthNormalCosts, cudaRandStates, cudaSelectedViews, params, iter);
 		CUDA::checkCudaCall(cudaGetLastError());
-		RedPixelProcess<<<gridSizeCheckerboard, blockSize>>>(cudaTextureImages, cudaTextureDepths, cudaCameras, cudaDepthNormalEstimates, cudaLowDepths, cudaDepthNormalCosts, cudaRandStates, cudaSelectedViews, params, iter);
+		RedPixelProcess<<<gridSizeCheckerboard, blockSize, 0, stream>>>(cudaTextureImages, cudaTextureDepths, cudaCameras, cudaDepthNormalEstimates, cudaLowDepths, cudaDepthNormalCosts, cudaRandStates, cudaSelectedViews, params, iter);
 		CUDA::checkCudaCall(cudaGetLastError());
 	}
 
 	if (params.fThresholdKeepCost > 0) {
-		FilterPlanes<<<gridSizeFull, blockSize>>>(cudaDepthNormalEstimates, cudaDepthNormalCosts, cudaSelectedViews, width, height, params);
+		FilterPlanes<<<gridSizeFull, blockSize, 0, stream>>>(cudaDepthNormalEstimates, cudaDepthNormalCosts, cudaSelectedViews, width, height, params);
 		CUDA::checkCudaCall(cudaGetLastError());
 	}
 
-	CUDA::checkCudaCall(cudaMemcpy(depthNormalEstimates, cudaDepthNormalEstimates, sizeof(Point4) * width * height, cudaMemcpyDeviceToHost));
+	const size_t numPixels((size_t)width * height);
+	CUDA::checkCudaCall(cudaMemcpyAsync(depthNormalEstimates, cudaDepthNormalEstimates, sizeof(Point4) * numPixels, cudaMemcpyDeviceToHost, stream));
 	if (ptrCostMap)
-		CUDA::checkCudaCall(cudaMemcpy(ptrCostMap, cudaDepthNormalCosts, sizeof(float) * width * height, cudaMemcpyDeviceToHost));
+		CUDA::checkCudaCall(cudaMemcpyAsync(hostCostMap, cudaDepthNormalCosts, sizeof(float) * numPixels, cudaMemcpyDeviceToHost, stream));
 	if (ptrViewsMap)
-		CUDA::checkCudaCall(cudaMemcpy(ptrViewsMap, cudaSelectedViews, sizeof(uint32_t) * width * height, cudaMemcpyDeviceToHost));
+		CUDA::checkCudaCall(cudaMemcpyAsync(hostViewsMap, cudaSelectedViews, sizeof(uint32_t) * numPixels, cudaMemcpyDeviceToHost, stream));
+	CUDA::checkCudaCall(cudaStreamSynchronize(stream));
+	if (ptrCostMap)
+		memcpy(ptrCostMap, hostCostMap, sizeof(float) * numPixels);
+	if (ptrViewsMap)
+		memcpy(ptrViewsMap, hostViewsMap, sizeof(uint32_t) * numPixels);
 }
 /*----------------------------------------------------------------*/
