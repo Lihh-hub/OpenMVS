@@ -78,17 +78,25 @@ inline void __ensureCudaResult(CUresult result, LPCSTR errorMessage) {
 }
 #define ensureCudaResult(val) CUDA::__ensureCudaResult(val, #val)
 
-inline void checkCudaCall(const cudaError_t error) {
+inline void __checkCudaRuntime(const cudaError_t error, LPCSTR file, int line) {
 	if (error == cudaSuccess)
 		return;
 	#ifdef _DEBUG
-	VERBOSE("CUDA error at %s:%d: %s (code %d)", __FILE__, __LINE__, cudaGetErrorString(error), error);
+	VERBOSE("CUDA error at %s:%d: %s (code %d)", file, line, cudaGetErrorString(error), error);
 	#else
 	DEBUG("CUDA error: %s (code %d)", cudaGetErrorString(error), error);
 	#endif
 	ASSERT("CudaError" == NULL);
 	exit(EXIT_FAILURE);
 }
+
+inline void checkCudaCall(const cudaError_t error) {
+	__checkCudaRuntime(error, __FILE__, __LINE__);
+}
+
+#ifndef CUDA_RT_CHECK
+#define CUDA_RT_CHECK(val) CUDA::__checkCudaRuntime((val), __FILE__, __LINE__)
+#endif
 
 // rounds up addr to the align boundary
 template <typename T>
