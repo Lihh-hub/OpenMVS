@@ -63,8 +63,8 @@ PatchMatchCUDA::PatchMatchCUDA(int device)
 	, lowDepthCapacity(0)
 {
 	// initialize CUDA device if needed
-	if (CUDA::devices.IsEmpty())
-		CUDA::initDevice(device);
+	if (CUDA::devices.IsEmpty() && CUDA::initDevice(device) != CUDA_SUCCESS)
+		return;
 	EnsureCUDAStream();
 }
 
@@ -124,6 +124,8 @@ void PatchMatchCUDA::Release()
 
 void PatchMatchCUDA::EnsureCUDAStream()
 {
+	if (CUDA::devices.IsEmpty())
+		return;
 	if (stream == NULL)
 		CUDA::checkCudaCall(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
 }
@@ -180,6 +182,8 @@ void PatchMatchCUDA::ReleaseCUDA()
 
 void PatchMatchCUDA::Init(bool bGeomConsistency)
 {
+	if (CUDA::devices.IsEmpty())
+		return;
 	EnsureCUDAStream();
 	if (bGeomConsistency) {
 		params.bGeomConsistency = true;
